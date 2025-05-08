@@ -28,7 +28,7 @@
 """
 import Domoticz
 from asyncio import get_event_loop
-from huawei_solar import HuaweiSolarBridge
+from huawei_solar import HuaweiSolarBridge, create_tcp_bridge
 from huawei_solar import register_names as rn
 
 class HuaweiSolarPlugin:
@@ -183,7 +183,7 @@ class HuaweiSolarPlugin:
     def _connectInverter(self):
         Domoticz.Log("Connecting inverter")
         try:
-            bridge = self.async_loop.run_until_complete(HuaweiSolarBridge.create(
+            bridge = self.async_loop.run_until_complete(create_tcp_bridge(
                 host=self.inverterserveraddress, port=int(self.inverterserverport), slave_id=1))
             Domoticz.Log("Inverter connected")
             return bridge
