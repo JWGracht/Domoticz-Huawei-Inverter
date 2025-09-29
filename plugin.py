@@ -27,7 +27,7 @@
 </plugin>
 """
 import Domoticz
-from asyncio import get_event_loop
+from asyncio import new_event_loop
 from huawei_solar import HuaweiSolarBridge, create_tcp_bridge
 from huawei_solar import register_names as rn
 
@@ -43,7 +43,7 @@ class HuaweiSolarPlugin:
     device_status = None
 
     def __init__(self):
-        self.async_loop = get_event_loop()
+        self.async_loop = new_event_loop()
 
     def onStart(self):
         Domoticz.Log("onStart called")
