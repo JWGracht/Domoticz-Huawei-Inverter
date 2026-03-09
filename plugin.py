@@ -54,6 +54,12 @@ DEVICE_CONFIGS: Dict[str, Tuple[List[str], int, int]] = {
     ),
     "percentage": (["EFFICIENCY"], 243, 6),
     "text": (["DEVICE_STATUS"], 243, 19),
+    "temperature": (
+        ["INTERNAL_TEMPERATURE", "ANTI_REVERSE_MODULE_1_TEMP", "INV_MODULE_A_TEMP",
+         "INV_MODULE_B_TEMP", "INV_MODULE_C_TEMP"],
+        80, 5
+    ),
+    
 }
 
 # Fast update registers (every heartbeat)
@@ -69,7 +75,10 @@ FAST_UPDATE_REGISTERS = [
 ]
 
 # Slow update registers (every 60 seconds)
-SLOW_UPDATE_REGISTERS = [rn.EFFICIENCY, rn.DEVICE_STATUS, rn.ACCUMULATED_YIELD_ENERGY]
+SLOW_UPDATE_REGISTERS = [
+    rn.EFFICIENCY, rn.DEVICE_STATUS, rn.ACCUMULATED_YIELD_ENERGY, rn.INTERNAL_TEMPERATURE,
+    rn.ANTI_REVERSE_MODULE_1_TEMP, rn.INV_MODULE_A_TEMP, rn.INV_MODULE_B_TEMP, rn.INV_MODULE_C_TEMP
+]
 
 # Mapping between register names and device names
 REGISTER_TO_DEVICE: Dict[str, str] = {
@@ -102,6 +111,11 @@ REGISTER_TO_DEVICE: Dict[str, str] = {
     'efficiency': 'EFFICIENCY',
     'device_status': 'DEVICE_STATUS',
     'accumulated_yield_energy': 'accumulated_yield_energy',
+    "internal_temperature": "INTERNAL_TEMPERATURE",
+    "anti_reverse_module_1_temp": "ANTI_REVERSE_MODULE_1_TEMP",
+    "inv_module_a_temp": "INV_MODULE_A_TEMP",
+    "inv_module_b_temp": "INV_MODULE_B_TEMP",
+    "inv_module_c_temp": "INV_MODULE_C_TEMP",
 }
 
 
