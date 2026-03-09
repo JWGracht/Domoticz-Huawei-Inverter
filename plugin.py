@@ -27,240 +27,329 @@
 </plugin>
 """
 import Domoticz
-from asyncio import new_event_loop
+from asyncio import new_event_loop, AbstractEventLoop
+from typing import Optional, Dict, List, Tuple, Any
 from huawei_solar import HuaweiSolarBridge, create_tcp_bridge
 from huawei_solar import register_names as rn
 
+
+# Device configuration mapping
+DEVICE_CONFIGS: Dict[str, Tuple[List[str], int, int]] = {
+    "voltage": (
+        ["PV_01_VOLTAGE", "PV_02_VOLTAGE", "PV_03_VOLTAGE", "PV_04_VOLTAGE",
+         "PHASE_A_VOLTAGE", "PHASE_B_VOLTAGE", "PHASE_C_VOLTAGE",
+         "GRID_A_VOLTAGE", "GRID_B_VOLTAGE", "GRID_C_VOLTAGE"],
+        243, 8
+    ),
+    "current": (
+        ["PV_01_CURRENT", "PV_02_CURRENT", "PV_03_CURRENT", "PV_04_CURRENT",
+         "PHASE_A_CURRENT", "PHASE_B_CURRENT", "PHASE_C_CURRENT",
+         "ACTIVE_GRID_A_CURRENT", "ACTIVE_GRID_B_CURRENT", "ACTIVE_GRID_C_CURRENT"],
+        243, 23
+    ),
+    "power": (
+        ["INPUT_POWER", "ACTIVE_POWER_FAST", "REACTIVE_POWER",
+         "ACTIVE_GRID_A_POWER", "ACTIVE_GRID_B_POWER", "ACTIVE_GRID_C_POWER"],
+        248, 1
+    ),
+    "percentage": (["EFFICIENCY"], 243, 6),
+    "text": (["DEVICE_STATUS"], 243, 19),
+}
+
+# Fast update registers (every heartbeat)
+FAST_UPDATE_REGISTERS = [
+    rn.INPUT_POWER, rn.PHASE_A_VOLTAGE, rn.PHASE_B_VOLTAGE, rn.PHASE_C_VOLTAGE,
+    rn.PHASE_A_CURRENT, rn.PHASE_B_CURRENT, rn.PHASE_C_CURRENT,
+    rn.ACTIVE_POWER_FAST, rn.REACTIVE_POWER,
+    rn.PV_01_VOLTAGE, rn.PV_01_CURRENT, rn.PV_02_VOLTAGE, rn.PV_02_CURRENT,
+    rn.PV_03_VOLTAGE, rn.PV_03_CURRENT, rn.PV_04_VOLTAGE, rn.PV_04_CURRENT,
+    rn.GRID_A_VOLTAGE, rn.GRID_B_VOLTAGE, rn.GRID_C_VOLTAGE,
+    rn.ACTIVE_GRID_A_CURRENT, rn.ACTIVE_GRID_B_CURRENT, rn.ACTIVE_GRID_C_CURRENT,
+    rn.ACTIVE_GRID_A_POWER, rn.ACTIVE_GRID_B_POWER, rn.ACTIVE_GRID_C_POWER
+]
+
+# Slow update registers (every 60 seconds)
+SLOW_UPDATE_REGISTERS = [rn.EFFICIENCY, rn.DEVICE_STATUS, rn.ACCUMULATED_YIELD_ENERGY]
+
+# Mapping between register names and device names
+REGISTER_TO_DEVICE: Dict[str, str] = {
+    'pv_01_voltage': 'PV_01_VOLTAGE',
+    'pv_02_voltage': 'PV_02_VOLTAGE',
+    'pv_03_voltage': 'PV_03_VOLTAGE',
+    'pv_04_voltage': 'PV_04_VOLTAGE',
+    'pv_01_current': 'PV_01_CURRENT',
+    'pv_02_current': 'PV_02_CURRENT',
+    'pv_03_current': 'PV_03_CURRENT',
+    'pv_04_current': 'PV_04_CURRENT',
+    'input_power': 'INPUT_POWER',
+    'phase_A_voltage': 'PHASE_A_VOLTAGE',
+    'phase_B_voltage': 'PHASE_B_VOLTAGE',
+    'phase_C_voltage': 'PHASE_C_VOLTAGE',
+    'phase_A_current': 'PHASE_A_CURRENT',
+    'phase_B_current': 'PHASE_B_CURRENT',
+    'phase_C_current': 'PHASE_C_CURRENT',
+    'active_power_fast': 'ACTIVE_POWER_FAST',
+    'reactive_power': 'REACTIVE_POWER',
+    'grid_A_voltage': 'GRID_A_VOLTAGE',
+    'grid_B_voltage': 'GRID_B_VOLTAGE',
+    'grid_C_voltage': 'GRID_C_VOLTAGE',
+    'active_grid_A_current': 'ACTIVE_GRID_A_CURRENT',
+    'active_grid_B_current': 'ACTIVE_GRID_B_CURRENT',
+    'active_grid_C_current': 'ACTIVE_GRID_C_CURRENT',
+    'active_grid_A_power': 'ACTIVE_GRID_A_POWER',
+    'active_grid_B_power': 'ACTIVE_GRID_B_POWER',
+    'active_grid_C_power': 'ACTIVE_GRID_C_POWER',
+    'efficiency': 'EFFICIENCY',
+    'device_status': 'DEVICE_STATUS',
+    'accumulated_yield_energy': 'accumulated_yield_energy',
+}
+
+
 class HuaweiSolarPlugin:
-    enabled = False
-    inverterserveraddress = "127.0.0.1"
-    inverterserverport = "502"
-    bridge = None
-    minuteCounter = 0
-    accumulated_yield_energy = 0
-    async_loop = None
-    efficiency = 0
-    device_status = None
+    """Domoticz plugin for Huawei Solar inverters via Modbus TCP/IP."""
 
-    def __init__(self):
-        self.async_loop = new_event_loop()
+    def __init__(self) -> None:
+        self.inverter_address: str = "127.0.0.1"
+        self.inverter_port: int = 502
+        self.bridge: Optional[HuaweiSolarBridge] = None
+        self.async_loop: AbstractEventLoop = new_event_loop()
+        self.minute_counter: int = 0
+        self.accumulated_yield_energy: float = 0.0
+        self.last_update_time: Dict[str, float] = {}
 
-    def onStart(self):
+    def onStart(self) -> None:
+        """Initialize the plugin on startup."""
         Domoticz.Log("onStart called")
-        self.minuteCounter = 0
-        self.inverterserveraddress = Parameters["Address"].strip()
-        self.inverterserverport = Parameters["Port"].strip()
-        self.bridge = self._connectInverter()
+        self.minute_counter = 0
+        self.inverter_address = Parameters["Address"].strip()
+        self.inverter_port = int(Parameters["Port"].strip())
+        self.bridge = self._connect_inverter()
 
-        voltage_devices = ["PV_01_VOLTAGE", "PV_02_VOLTAGE", "PV_03_VOLTAGE", "PV_04_VOLTAGE", "PHASE_A_VOLTAGE", "PHASE_B_VOLTAGE", "PHASE_C_VOLTAGE", "GRID_A_VOLTAGE", "GRID_B_VOLTAGE", "GRID_C_VOLTAGE"]
-        self._createDevices(voltage_devices, 243, 8)
+        # Create all devices
+        for config_devices, device_type, subtype in DEVICE_CONFIGS.values():
+            self._create_devices(config_devices, device_type, subtype)
 
-        current_devices = ["PV_01_CURRENT", "PV_02_CURRENT", "PV_03_CURRENT", "PV_04_CURRENT", "PHASE_A_CURRENT", "PHASE_B_CURRENT", "PHASE_C_CURRENT", "ACTIVE_GRID_A_CURRENT", "ACTIVE_GRID_B_CURRENT", "ACTIVE_GRID_C_CURRENT"]
-        self._createDevices(current_devices, 243, 23)
-
-        power_devices = ["INPUT_POWER", "ACTIVE_POWER_FAST", "REACTIVE_POWER", "ACTIVE_GRID_A_POWER", "ACTIVE_GRID_B_POWER", "ACTIVE_GRID_C_POWER"]
-        self._createDevices(power_devices, 248, 1)
-        
-        percentage_devices = ["EFFICIENCY"]
-        self._createDevices(percentage_devices, 243, 6)
-        
-        text_devices = ["DEVICE_STATUS"]
-        self._createDevices(text_devices, 243, 19)
-
-        # Create exported KWH meter
-        if self._getDevice("Energy Meter") < 0:
-            self._createDevice("Energy Meter", 243, 29, 4)
+        # Create energy meter device
+        if self._get_device("Energy Meter") < 0:
+            self._create_device("Energy Meter", 243, 29, 4)
 
         Domoticz.Heartbeat(5)
 
-    def onStop(self):
+    def onStop(self) -> None:
+        """Cleanup on shutdown."""
         Domoticz.Log("onStop called")
-        self.async_loop.close()
+        if self.async_loop and not self.async_loop.is_closed():
+            self.async_loop.close()
 
-    def onConnect(self, Connection, Status, Description):
-        Domoticz.Log("onConnect called")
+    def onConnect(self, Connection, Status: int, Description: str) -> None:
+        """Handle connection events."""
+        Domoticz.Log(f"onConnect called: Status={Status}, Description={Description}")
 
-    def onMessage(self, Connection, Data):
+    def onMessage(self, Connection, Data) -> None:
+        """Handle incoming messages."""
         Domoticz.Log("onMessage called")
 
-    def onCommand(self, DeviceID, Unit, Command, Level, Color):
-        Domoticz.Log(f"onCommand called for Device {DeviceID} Unit {Unit}: Parameter '{Command}', Level: {Level}")
+    def onCommand(self, DeviceID: int, Unit: int, Command: str, Level: int, Color: str) -> None:
+        """Handle device commands."""
+        Domoticz.Log(f"onCommand called for Device {DeviceID} Unit {Unit}: Command='{Command}', Level={Level}")
 
-    def onNotification(self, Name, Subject, Text, Status, Priority, Sound, ImageFile):
-        Domoticz.Log(f"Notification: {Name},{Subject},{Text},{Status},{Priority},{Sound},{ImageFile}")
+    def onNotification(self, Name: str, Subject: str, Text: str, Status: str, Priority: int, Sound: str, ImageFile: str) -> None:
+        """Handle notifications."""
+        Domoticz.Log(f"Notification: {Name}, {Subject}, {Text}, {Status}, {Priority}, {Sound}, {ImageFile}")
 
-    def onDisconnect(self, Connection):
+    def onDisconnect(self, Connection) -> None:
+        """Handle disconnection events."""
         Domoticz.Log("onDisconnect called")
 
-    def onHeartbeat(self):
-        Domoticz.Log("onHeartbeat called")
-
-        # Get 5 second data
+    def onHeartbeat(self) -> None:
+        """Main heartbeat handler - called every 5 seconds."""
         try:
-            result = self.async_loop.run_until_complete(self.bridge.batch_update([
-                rn.INPUT_POWER, rn.PHASE_A_VOLTAGE, rn.PHASE_B_VOLTAGE, rn.PHASE_C_VOLTAGE,
-                rn.PHASE_A_CURRENT, rn.PHASE_B_CURRENT, rn.PHASE_C_CURRENT,
-                rn.ACTIVE_POWER_FAST, rn.REACTIVE_POWER,
-                rn.PV_01_VOLTAGE, rn.PV_01_CURRENT, rn.PV_02_VOLTAGE, rn.PV_02_CURRENT, rn.PV_03_VOLTAGE, rn.PV_03_CURRENT, rn.PV_04_VOLTAGE, rn.PV_04_CURRENT,
-                rn.GRID_A_VOLTAGE, rn.GRID_B_VOLTAGE, rn.GRID_C_VOLTAGE,
-                rn.ACTIVE_GRID_A_CURRENT, rn.ACTIVE_GRID_B_CURRENT, rn.ACTIVE_GRID_C_CURRENT,
-                rn.ACTIVE_GRID_A_POWER, rn.ACTIVE_GRID_B_POWER, rn.ACTIVE_GRID_C_POWER
-            ]))
-            pv_01_voltage = result['pv_01_voltage'][0]
-            pv_02_voltage = result['pv_02_voltage'][0]
-            pv_03_voltage = result['pv_03_voltage'][0]
-            pv_04_voltage = result['pv_04_voltage'][0]
-            pv_01_current = result['pv_01_current'][0]
-            pv_02_current = result['pv_02_current'][0]
-            pv_03_current = result['pv_03_current'][0]
-            pv_04_current = result['pv_04_current'][0]
-            input_power = result['input_power'][0]
-            phase_A_voltage = result['phase_A_voltage'][0]
-            phase_B_voltage = result['phase_B_voltage'][0]
-            phase_C_voltage = result['phase_C_voltage'][0]
-            phase_A_current = result['phase_A_current'][0]
-            phase_B_current = result['phase_B_current'][0]
-            phase_C_current = result['phase_C_current'][0]
-            active_power_fast = result['active_power_fast'][0]
-            reactive_power = result['reactive_power'][0]
-            grid_A_voltage = result['grid_A_voltage'][0]
-            grid_B_voltage = result['grid_B_voltage'][0]
-            grid_C_voltage = result['grid_C_voltage'][0]
-            active_grid_A_current = result['active_grid_A_current'][0]
-            active_grid_B_current = result['active_grid_B_current'][0]
-            active_grid_C_current = result['active_grid_C_current'][0]
-            active_grid_A_power = result['active_grid_A_power'][0]
-            active_grid_B_power = result['active_grid_B_power'][0]
-            active_grid_C_power = result['active_grid_C_power'][0]
-            
-            # Get 1 minute data
-            if self.minuteCounter == 12:
-                self.minuteCounter = 0
-            if self.minuteCounter == 0:
-                result = self.async_loop.run_until_complete(self.bridge.batch_update([rn.EFFICIENCY, rn.DEVICE_STATUS, rn.ACCUMULATED_YIELD_ENERGY]))
-                self.efficiency = result['efficiency'][0]
-                self.device_status = result['device_status'][0]
-                self.accumulated_yield_energy = result['accumulated_yield_energy'][0] * 1000
+            if self.bridge is None:
+                Domoticz.Error("Bridge is None, attempting reconnection...")
+                self._reconnect_inverter()
+                return
 
-            self.minuteCounter += 1
-            
-            #update Domoticz devices
-            self._updateDevice("PV_01_VOLTAGE", str(pv_01_voltage))
-            self._updateDevice("PV_02_VOLTAGE", str(pv_02_voltage))
-            self._updateDevice("PV_03_VOLTAGE", str(pv_03_voltage))
-            self._updateDevice("PV_04_VOLTAGE", str(pv_04_voltage))
-            self._updateDevice("PV_01_CURRENT", str(pv_01_current))
-            self._updateDevice("PV_02_CURRENT", str(pv_02_current))
-            self._updateDevice("PV_03_CURRENT", str(pv_03_current))
-            self._updateDevice("PV_04_CURRENT", str(pv_04_current))
-            self._updateDevice("INPUT_POWER", str(input_power))
-            self._updateDevice("PHASE_A_VOLTAGE", str(phase_A_voltage))
-            self._updateDevice("PHASE_B_VOLTAGE", str(phase_B_voltage))
-            self._updateDevice("PHASE_C_VOLTAGE", str(phase_C_voltage))
-            self._updateDevice("PHASE_A_CURRENT", str(phase_A_current))
-            self._updateDevice("PHASE_B_CURRENT", str(phase_B_current))
-            self._updateDevice("PHASE_C_CURRENT", str(phase_C_current))
-            self._updateDevice("ACTIVE_POWER_FAST", str(active_power_fast))
-            self._updateDevice("REACTIVE_POWER", str(reactive_power))
-            self._updateDevice("Energy Meter", str(active_power_fast)+";"+str(self.accumulated_yield_energy))
-            self._updateDevice("GRID_A_VOLTAGE", str(grid_A_voltage))
-            self._updateDevice("GRID_B_VOLTAGE", str(grid_B_voltage))
-            self._updateDevice("GRID_C_VOLTAGE", str(grid_C_voltage))
-            self._updateDevice("ACTIVE_GRID_A_CURRENT", str(active_grid_A_current))
-            self._updateDevice("ACTIVE_GRID_B_CURRENT", str(active_grid_B_current))
-            self._updateDevice("ACTIVE_GRID_C_CURRENT", str(active_grid_C_current))
-            self._updateDevice("ACTIVE_GRID_A_POWER", str(active_grid_A_power))
-            self._updateDevice("ACTIVE_GRID_B_POWER", str(active_grid_B_power))
-            self._updateDevice("ACTIVE_GRID_C_POWER", str(active_grid_C_power))
-            self._updateDevice("EFFICIENCY", str(self.efficiency))
-            self._updateDevice("DEVICE_STATUS", str(self.device_status))
+            # Update fast-changing values (every heartbeat)
+            fast_result = self.async_loop.run_until_complete(
+                self.bridge.batch_update(FAST_UPDATE_REGISTERS)
+            )
+            self._process_results(fast_result)
+
+            # Update slow-changing values every 60 seconds (every 12th heartbeat)
+            if self.minute_counter % 12 == 0:
+                slow_result = self.async_loop.run_until_complete(
+                    self.bridge.batch_update(SLOW_UPDATE_REGISTERS)
+                )
+                self._process_results(slow_result)
+                
+                # Update energy meter
+                if 'accumulated_yield_energy' in slow_result:
+                    self.accumulated_yield_energy = slow_result['accumulated_yield_energy'][0] * 1000
+
+            self.minute_counter += 1
 
         except (TimeoutError, Exception) as e:
             Domoticz.Error(f"Error in onHeartbeat: {str(e)}")
-            Domoticz.Log("Trying to reconnect to inverter...")
-            self._reconnectInverter()
+            Domoticz.Log("Attempting to reconnect to inverter...")
+            self._reconnect_inverter()
 
-    def _connectInverter(self):
-        Domoticz.Log("Connecting inverter")
+    def _process_results(self, result: Dict[str, Any]) -> None:
+        """Process and update devices with results from batch_update."""
+        for key, value in result.items():
+            if key in REGISTER_TO_DEVICE:
+                device_name = REGISTER_TO_DEVICE[key]
+                if key == 'accumulated_yield_energy':
+                    continue  # Handle separately in onHeartbeat
+                
+                # Extract first element from the result tuple
+                device_value = str(value[0]) if isinstance(value, (list, tuple)) else str(value)
+                self._update_device(device_name, device_value)
+
+        # Update energy meter with combined values
+        if 'active_power_fast' in result:
+            active_power = result['active_power_fast'][0]
+            energy_value = f"{active_power};{self.accumulated_yield_energy}"
+            self._update_device("Energy Meter", energy_value)
+
+    def _connect_inverter(self) -> Optional[HuaweiSolarBridge]:
+        """Establish connection to the inverter."""
+        Domoticz.Log(f"Connecting to inverter at {self.inverter_address}:{self.inverter_port}")
         try:
-            bridge = self.async_loop.run_until_complete(create_tcp_bridge(
-                host=self.inverterserveraddress, port=int(self.inverterserverport), slave_id=1))
-            Domoticz.Log("Inverter connected")
+            bridge = self.async_loop.run_until_complete(
+                create_tcp_bridge(
+                    host=self.inverter_address,
+                    port=self.inverter_port,
+                    slave_id=1
+                )
+            )
+            Domoticz.Log("Inverter connected successfully")
             return bridge
         except Exception as e:
             Domoticz.Error(f"Failed to connect to inverter: {str(e)}")
             return None
 
-    def _reconnectInverter(self):
+    def _reconnect_inverter(self) -> None:
+        """Attempt to reconnect to the inverter."""
         try:
-            self.bridge = self._connectInverter()
+            self.bridge = self._connect_inverter()
             if self.bridge:
-                Domoticz.Log("Reconnected successfully.")
+                Domoticz.Log("Reconnected successfully")
             else:
-                Domoticz.Error("Reconnection failed.")
+                Domoticz.Error("Reconnection failed")
         except Exception as e:
-            Domoticz.Error(f"Reconnection attempt failed with error: {e}")
+            Domoticz.Error(f"Reconnection attempt failed: {e}")
 
-    def _getDevice(self, name):
-        for Device in Devices:
-            if Devices[Device].DeviceID.strip() == name:
-                return Device
+    def _get_device(self, name: str) -> int:
+        """Find device by name. Returns device unit number or -1 if not found."""
+        for unit, device in Devices.items():
+            if device.DeviceID.strip() == name:
+                return unit
         return -1
 
-    def _createDevices(self, device_list, device_type, subtype):
-        for device in device_list:
-            if self._getDevice(device) < 0:
-                self._createDevice(device, device_type, subtype)
+    def _create_devices(self, device_list: List[str], device_type: int, subtype: int) -> None:
+        """Create multiple devices if they don't exist."""
+        for device_name in device_list:
+            if self._get_device(device_name) < 0:
+                self._create_device(device_name, device_type, subtype)
 
-    def _createDevice(self, name, device_type, subtype, switchtype=0):
-        iUnit = 0
-        for x in range(1, 256):
-            if x not in Devices:
-                iUnit = x
-                break
-        if iUnit == 0:
-            iUnit = len(Devices) + 1
-        Domoticz.Device(Name=name, Unit=iUnit, Type=device_type, Subtype=subtype, Used=0, DeviceID=name, Switchtype=switchtype).Create()
+    def _create_device(self, name: str, device_type: int, subtype: int, switchtype: int = 0) -> None:
+        """Create a single device in Domoticz."""
+        unit = self._find_available_unit()
+        if unit == 0:
+            Domoticz.Error(f"Failed to create device {name}: No available units")
+            return
 
-    def _updateDevice(self, name, value):
         try:
-            device = Devices[self._getDevice(name)]
-            if device and device.sValue != value:
+            Domoticz.Device(
+                Name=name,
+                Unit=unit,
+                Type=device_type,
+                Subtype=subtype,
+                Used=0,
+                DeviceID=name,
+                Switchtype=switchtype
+            ).Create()
+            Domoticz.Log(f"Device created: {name} (Unit {unit})")
+        except Exception as e:
+            Domoticz.Error(f"Failed to create device {name}: {str(e)}")
+
+    def _find_available_unit(self) -> int:
+        """Find the first available device unit number."""
+        for unit in range(1, 256):
+            if unit not in Devices:
+                return unit
+        return 0
+
+    def _update_device(self, name: str, value: str) -> None:
+        """Update a device's value if it has changed."""
+        unit = self._get_device(name)
+        if unit < 0:
+            Domoticz.Warning(f"Device not found: {name}")
+            return
+
+        try:
+            device = Devices[unit]
+            if device.sValue != value:
                 device.Update(nValue=0, sValue=value)
         except Exception as e:
-            Domoticz.Error(f"Failed to update device: {str(e)}")
+            Domoticz.Error(f"Failed to update device {name}: {str(e)}")
 
-global _plugin
-_plugin = HuaweiSolarPlugin()
 
-def onStart():
+# Global plugin instance
+_plugin: Optional[HuaweiSolarPlugin] = None
+
+
+def onStart() -> None:
+    """Domoticz callback: plugin startup."""
     global _plugin
+    _plugin = HuaweiSolarPlugin()
     _plugin.onStart()
 
-def onStop():
-    global _plugin
-    _plugin.onStop()
 
-def onConnect(Connection, Status, Description):
+def onStop() -> None:
+    """Domoticz callback: plugin shutdown."""
     global _plugin
-    _plugin.onConnect(Connection, Status, Description)
+    if _plugin:
+        _plugin.onStop()
 
-def onMessage(Connection, Data):
-    global _plugin
-    _plugin.onMessage(Connection, Data)
 
-def onCommand(DeviceID, Unit, Command, Level, Color):
+def onConnect(Connection, Status: int, Description: str) -> None:
+    """Domoticz callback: connection event."""
     global _plugin
-    _plugin.onCommand(DeviceID, Unit, Command, Level, Color)
+    if _plugin:
+        _plugin.onConnect(Connection, Status, Description)
 
-def onNotification(Name, Subject, Text, Status, Priority, Sound, ImageFile):
-    global _plugin
-    _plugin.onNotification(Name, Subject, Text, Status, Priority, Sound, ImageFile)
 
-def onDisconnect(Connection):
+def onMessage(Connection, Data) -> None:
+    """Domoticz callback: incoming message."""
     global _plugin
-    _plugin.onDisconnect(Connection)
+    if _plugin:
+        _plugin.onMessage(Connection, Data)
 
-def onHeartbeat():
+
+def onCommand(DeviceID: int, Unit: int, Command: str, Level: int, Color: str) -> None:
+    """Domoticz callback: device command."""
     global _plugin
-    _plugin.onHeartbeat()
+    if _plugin:
+        _plugin.onCommand(DeviceID, Unit, Command, Level, Color)
+
+
+def onNotification(Name: str, Subject: str, Text: str, Status: str, Priority: int, Sound: str, ImageFile: str) -> None:
+    """Domoticz callback: notification."""
+    global _plugin
+    if _plugin:
+        _plugin.onNotification(Name, Subject, Text, Status, Priority, Sound, ImageFile)
+
+
+def onDisconnect(Connection) -> None:
+    """Domoticz callback: disconnection event."""
+    global _plugin
+    if _plugin:
+        _plugin.onDisconnect(Connection)
+
+
+def onHeartbeat() -> None:
+    """Domoticz callback: heartbeat."""
+    global _plugin
+    if _plugin:
+        _plugin.onHeartbeat()
