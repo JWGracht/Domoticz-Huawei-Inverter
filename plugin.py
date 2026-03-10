@@ -28,9 +28,15 @@
 """
 import Domoticz
 from asyncio import new_event_loop, AbstractEventLoop
-from typing import Optional, Dict, List, Tuple, Any
-from huawei_solar import HuaweiSolarBridge, create_tcp_bridge
-from huawei_solar import register_names as rn
+from typing import Optional, Dict, List, Tuple, Any, Set
+import time
+
+try:
+    from huawei_solar import HuaweiSolarBridge, create_tcp_bridge
+    from huawei_solar import register_names as rn
+except ImportError as e:
+    Domoticz.Error(f"Failed to import huawei_solar: {e}")
+    Domoticz.Error(f"Please install with: pip3 install -U huawei-solar")
 
 
 # Device configuration mapping
@@ -74,7 +80,7 @@ FAST_UPDATE_REGISTERS = [
     rn.ACTIVE_GRID_A_POWER, rn.ACTIVE_GRID_B_POWER, rn.ACTIVE_GRID_C_POWER
 ]
 
-# Slow update registers (every 60 seconds)
+# Slow update registers (every 60 seconds = 12 heartbeats)
 SLOW_UPDATE_REGISTERS = [
     rn.EFFICIENCY, rn.DEVICE_STATUS, rn.ACCUMULATED_YIELD_ENERGY, rn.INTERNAL_TEMPERATURE,
     rn.ANTI_REVERSE_MODULE_1_TEMP, rn.INV_MODULE_A_TEMP, rn.INV_MODULE_B_TEMP, rn.INV_MODULE_C_TEMP
@@ -120,30 +126,39 @@ REGISTER_TO_DEVICE: Dict[str, str] = {
 
 
 class HuaweiSolarPlugin:
-    """Domoticz plugin for Huawei Solar inverters via Modbus TCP/IP."""
+    """Domoticz plugin for Huawei Solar inverters via Modbus TCP/IP.
+    """
 
     def __init__(self) -> None:
+        self.enabled = False
         self.inverter_address: str = "127.0.0.1"
         self.inverter_port: int = 502
         self.bridge: Optional[HuaweiSolarBridge] = None
-        self.async_loop: AbstractEventLoop = new_event_loop()
         self.minute_counter: int = 0
-        self.accumulated_yield_energy: float = 0.0
-        self.last_update_time: Dict[str, float] = {}
+        self.accumulated_yield_energy: float = 0
+        self.async_loop: AbstractEventLoop = new_event_loop()
+        self.efficiency: float = 0
+        self.device_status: str = ""
+        
+        # New: Value caching to avoid unnecessary updates
+        self.cached_values: Dict[str, Any] = {}
+        self.last_update_time: float = time.time()
 
     def onStart(self) -> None:
         """Initialize the plugin on startup."""
-        Domoticz.Log("onStart called")
+        Domoticz.Log("========================================")
+        Domoticz.Log("Huawei Solar Inverter Plugin")
+        Domoticz.Log("========================================")
         self.minute_counter = 0
         self.inverter_address = Parameters["Address"].strip()
         self.inverter_port = int(Parameters["Port"].strip())
         self.bridge = self._connect_inverter()
 
-        # Create all devices
-        for config_devices, device_type, subtype in DEVICE_CONFIGS.values():
-            self._create_devices(config_devices, device_type, subtype)
+        # Create devices using configuration dictionary (cleaner than individual lists)
+        for device_name, (devices, device_type, subtype) in DEVICE_CONFIGS.items():
+            self._create_devices(devices, device_type, subtype)
 
-        # Create energy meter device
+        # Create exported KWH meter
         if self._get_device("Energy Meter") < 0:
             self._create_device("Energy Meter", 243, 29, 4)
 
@@ -153,11 +168,14 @@ class HuaweiSolarPlugin:
         """Cleanup on shutdown."""
         Domoticz.Log("onStop called")
         if self.async_loop and not self.async_loop.is_closed():
-            self.async_loop.close()
+            try:
+                self.async_loop.close()
+            except Exception as e:
+                Domoticz.Warning(f"Error closing event loop: {e}")
 
     def onConnect(self, Connection, Status: int, Description: str) -> None:
         """Handle connection events."""
-        Domoticz.Log(f"onConnect called: Status={Status}, Description={Description}")
+        Domoticz.Log(f"onConnect called: Status={Status}")
 
     def onMessage(self, Connection, Data) -> None:
         """Handle incoming messages."""
@@ -165,11 +183,11 @@ class HuaweiSolarPlugin:
 
     def onCommand(self, DeviceID: int, Unit: int, Command: str, Level: int, Color: str) -> None:
         """Handle device commands."""
-        Domoticz.Log(f"onCommand called for Device {DeviceID} Unit {Unit}: Command='{Command}', Level={Level}")
+        Domoticz.Log(f"onCommand: Device={DeviceID}, Unit={Unit}, Command='{Command}'")
 
     def onNotification(self, Name: str, Subject: str, Text: str, Status: str, Priority: int, Sound: str, ImageFile: str) -> None:
         """Handle notifications."""
-        Domoticz.Log(f"Notification: {Name}, {Subject}, {Text}, {Status}, {Priority}, {Sound}, {ImageFile}")
+        Domoticz.Log(f"Notification: {Name}")
 
     def onDisconnect(self, Connection) -> None:
         """Handle disconnection events."""
@@ -177,53 +195,89 @@ class HuaweiSolarPlugin:
 
     def onHeartbeat(self) -> None:
         """Main heartbeat handler - called every 5 seconds."""
+        Domoticz.Debug("onHeartbeat called")
+
         try:
-            if self.bridge is None:
-                Domoticz.Error("Bridge is None, attempting reconnection...")
+            if not self.bridge:
+                Domoticz.Warning("Bridge not available, attempting reconnection...")
+                self.bridge = self._connect_inverter()
+                if not self.bridge:
+                    return
+
+            # Get 5 second data (fast update)
+            try:
+                result = self.async_loop.run_until_complete(
+                    self.bridge.batch_update(FAST_UPDATE_REGISTERS)
+                )
+                self._process_results(result, register_type="fast")
+            except Exception as e:
+                Domoticz.Error(f"Error in fast update: {str(e)}")
                 self._reconnect_inverter()
                 return
 
-            # Update fast-changing values (every heartbeat)
-            fast_result = self.async_loop.run_until_complete(
-                self.bridge.batch_update(FAST_UPDATE_REGISTERS)
-            )
-            self._process_results(fast_result)
-
-            # Update slow-changing values every 60 seconds (every 12th heartbeat)
-            if self.minute_counter % 12 == 0:
-                slow_result = self.async_loop.run_until_complete(
-                    self.bridge.batch_update(SLOW_UPDATE_REGISTERS)
-                )
-                self._process_results(slow_result)
-                
-                # Update energy meter
-                if 'accumulated_yield_energy' in slow_result:
-                    self.accumulated_yield_energy = slow_result['accumulated_yield_energy'][0] * 1000
+            # Get 1 minute data (slow update) - every 12 heartbeats (60 seconds)
+            if self.minute_counter == 12:
+                self.minute_counter = 0
+            
+            if self.minute_counter == 0:
+                try:
+                    result = self.async_loop.run_until_complete(
+                        self.bridge.batch_update(SLOW_UPDATE_REGISTERS)
+                    )
+                    self._process_results(result, register_type="slow")
+                except Exception as e:
+                    Domoticz.Warning(f"Error in slow update: {str(e)}")
 
             self.minute_counter += 1
-
-        except (TimeoutError, Exception) as e:
-            Domoticz.Error(f"Error in onHeartbeat: {str(e)}")
-            Domoticz.Log("Attempting to reconnect to inverter...")
+            
+        except Exception as e:
+            Domoticz.Error(f"Unexpected error in onHeartbeat: {str(e)}")
             self._reconnect_inverter()
 
-    def _process_results(self, result: Dict[str, Any]) -> None:
+    def _process_results(self, result: Dict[str, Any], register_type: str = "fast") -> None:
         """Process and update devices with results from batch_update."""
+        updated_count = 0
+        
         for key, value in result.items():
-            if key in REGISTER_TO_DEVICE:
-                device_name = REGISTER_TO_DEVICE[key]
-                if key == 'accumulated_yield_energy':
-                    continue  # Handle separately in onHeartbeat
-                
-                # Extract first element from the result tuple
+            if key not in REGISTER_TO_DEVICE:
+                continue
+            
+            device_name = REGISTER_TO_DEVICE[key]
+            
+            # Skip special handling for accumulated yield
+            if key == 'accumulated_yield_energy':
+                try:
+                    self.accumulated_yield_energy = value[0] * 1000
+                    Domoticz.Debug(f"Updated accumulated yield: {self.accumulated_yield_energy}")
+                except Exception as e:
+                    Domoticz.Debug(f"Error processing yield: {e}")
+                continue
+            
+            try:
                 device_value = str(value[0]) if isinstance(value, (list, tuple)) else str(value)
-                self._update_device(device_name, device_value)
+                
+                # NEW: Cache check - only update if value changed
+                cache_key = f"{register_type}_{key}"
+                if cache_key not in self.cached_values or self.cached_values[cache_key] != device_value:
+                    self._update_device(device_name, device_value)
+                    self.cached_values[cache_key] = device_value
+                    updated_count += 1
+                
+            except (ValueError, IndexError, TypeError) as e:
+                Domoticz.Warning(f"Error processing register {key}: {str(e)}")
 
         # Update energy meter with combined values
         if 'active_power_fast' in result:
-            active_power = result['active_power_fast'][0]
-            energy_value = f"{active_power};{self.accumulated_yield_energy}"
-            self._update_device("Energy Meter", energy_value)
+            try:
+                active_power = result['active_power_fast'][0]
+                energy_value = f"{active_power};{self.accumulated_yield_energy}"
+                self._update_device("Energy Meter", energy_value)
+                updated_count += 1
+            except Exception as e:
+                Domoticz.Warning(f"Error updating energy meter: {str(e)}")
+        
+        if updated_count > 0:
+            Domoticz.Debug(f"Updated {updated_count} devices ({register_type})")
 
     def _connect_inverter(self) -> Optional[HuaweiSolarBridge]:
         """Establish connection to the inverter."""
@@ -245,6 +299,12 @@ class HuaweiSolarPlugin:
     def _reconnect_inverter(self) -> None:
         """Attempt to reconnect to the inverter."""
         try:
+            if self.bridge:
+                try:
+                    self.async_loop.run_until_complete(self.bridge.stop())
+                except Exception:
+                    pass
+            
             self.bridge = self._connect_inverter()
             if self.bridge:
                 Domoticz.Log("Reconnected successfully")
@@ -255,9 +315,9 @@ class HuaweiSolarPlugin:
 
     def _get_device(self, name: str) -> int:
         """Find device by name. Returns device unit number or -1 if not found."""
-        for unit, device in Devices.items():
+        for device_unit, device in Devices.items():
             if device.DeviceID.strip() == name:
-                return unit
+                return device_unit
         return -1
 
     def _create_devices(self, device_list: List[str], device_type: int, subtype: int) -> None:
@@ -272,7 +332,7 @@ class HuaweiSolarPlugin:
         if unit == 0:
             Domoticz.Error(f"Failed to create device {name}: No available units")
             return
-
+        
         try:
             Domoticz.Device(
                 Name=name,
@@ -283,7 +343,7 @@ class HuaweiSolarPlugin:
                 DeviceID=name,
                 Switchtype=switchtype
             ).Create()
-            Domoticz.Log(f"Device created: {name} (Unit {unit})")
+            Domoticz.Debug(f"Device created: {name} (Unit {unit})")
         except Exception as e:
             Domoticz.Error(f"Failed to create device {name}: {str(e)}")
 
@@ -298,7 +358,7 @@ class HuaweiSolarPlugin:
         """Update a device's value if it has changed."""
         unit = self._get_device(name)
         if unit < 0:
-            Domoticz.Warning(f"Device not found: {name}")
+            Domoticz.Debug(f"Device not found: {name}")
             return
 
         try:
