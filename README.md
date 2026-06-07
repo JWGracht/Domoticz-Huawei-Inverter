@@ -3,7 +3,7 @@ Domoticz plugin for Huawei Solar inverters via Modbus
 
 ## Prerequisites
 - Modbus connection enabled at the inverter
-- ([huwei_solar.py](https://gitlab.com/Emilv2/huawei-solar)) V2.4.0 or newer
+- ([huwei_solar.py](https://github.com/wlcrs/huawei-solar-lib)) V3.0.0 or newer
 
 ## Installation
 ```bash

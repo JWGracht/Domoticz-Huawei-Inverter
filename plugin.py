@@ -10,7 +10,7 @@
 #    3. pip3 install -U huawei-solar
 #
 """
-<plugin key="Domoticz-Huawei-Inverter" name="Huawei Solar inverter (modbus TCP/IP)" author="jwgracht" version="1.2.0" wikilink="" externallink="https://github.com/JWGracht/Domoticz-Huawei-Inverter/">
+<plugin key="Domoticz-Huawei-Inverter" name="Huawei Solar inverter (modbus TCP/IP)" author="jwgracht" version="2.0.0" wikilink="" externallink="https://github.com/JWGracht/Domoticz-Huawei-Inverter/">
     <description>
         <p>Domoticz plugin for Huawei Solar inverters via Modbus.</p>
         <p>Required:
@@ -23,6 +23,15 @@
     <params>
         <param field="Address" label="Your Huawei inverter IP Address" width="200px" required="true" default="192.168.200.1"/>
         <param field="Port" label="Port" width="40px" required="true" default="502"/>
+        <param field="Mode1" label="Modbus Slave ID" width="40px" required="true" default="1">
+            <description>Modbus slave address of the inverter (default: 1). Use 0 for single-inverter setups or 1-3 for multi-inverter daisy-chain configurations.</description>
+            <options>
+                <option label="0" value="0"/>
+                <option label="1 (default)" value="1" default="true"/>
+                <option label="2" value="2"/>
+                <option label="3" value="3"/>
+            </options>
+        </param>
     </params>
 </plugin>
 """
@@ -74,16 +83,17 @@ This plugin runs inside Domoticz's Python interpreter with CRITICAL constraints:
         ```
 
 5. HEARTBEAT IS YOUR TIMING MECHANISM
-   - Domoticz calls onHeartbeat() at fixed intervals (e.g., every 5 seconds)
+   - Domoticz calls onHeartbeat() at fixed intervals (e.g., every 30 seconds)
+   - Fast updates run every heartbeat
    - Use heartbeat counter to schedule slow updates
    - NEVER spawn background threads
    - Example of SUCCESS:
         ```
         def onHeartbeat(self):
+            self._update_fast_registers()  # Every heartbeat (30s)
+            if self.heartbeat_counter % 10 == 0:
+                self._update_slow_registers()  # Every 10 heartbeats (5 min)
             self.heartbeat_counter += 1
-            self._update_fast_registers()  # Every heartbeat
-            if self.heartbeat_counter % 12 == 0:
-                self._update_slow_registers()  # Every 12 heartbeats
         ```
 
 6. CLOSE EVENT LOOP PROPERLY IN onStop()
@@ -110,16 +120,33 @@ SUMMARY:
 """
 
 import Domoticz
-from asyncio import new_event_loop, AbstractEventLoop
+from asyncio import new_event_loop, AbstractEventLoop, wait_for, TimeoutError as AsyncTimeoutError
 from typing import Optional, Dict, List, Tuple, Any, Set
 import time
 
 try:
-    from huawei_solar import HuaweiSolarBridge, create_tcp_bridge
+    from huawei_solar import HuaweiSolarDevice, create_device_instance, create_tcp_client
     from huawei_solar import register_names as rn
 except ImportError as e:
     Domoticz.Error(f"Failed to import huawei_solar: {e}")
     Domoticz.Error(f"Please install with: pip3 install -U huawei-solar")
+
+# ============================================================================
+# TIMEOUT AND RETRY CONFIGURATION
+# ============================================================================
+# Timeout for batch_update operations (seconds).
+# The library itself has a 10s timeout per Modbus read with 3 retries.
+# This overall timeout prevents run_until_complete() from blocking indefinitely.
+BATCH_UPDATE_TIMEOUT = 25
+
+# Timeout for connection/reconnection attempts (seconds)
+CONNECTION_TIMEOUT = 15
+
+# Number of consecutive failures before backing off
+MAX_CONSECUTIVE_FAILURES = 3
+
+# Backoff multiplier: skip N heartbeats after MAX_CONSECUTIVE_FAILURES
+BACKOFF_HEARTBEATS = 6  # 6 * 30s = 3 minutes backoff
 
 
 # ============================================================================
@@ -166,7 +193,7 @@ DEVICE_CONFIGS: Dict[str, Tuple[List[str], int, int]] = {
     ),
 }
 
-# Fast update registers - fetched every heartbeat (5 seconds)
+# Fast update registers - fetched every heartbeat (30 seconds)
 # These are rapidly changing values that need frequent updates
 FAST_UPDATE_REGISTERS = [
     rn.INPUT_POWER, rn.PHASE_A_VOLTAGE, rn.PHASE_B_VOLTAGE, rn.PHASE_C_VOLTAGE,
@@ -179,8 +206,8 @@ FAST_UPDATE_REGISTERS = [
     rn.ACTIVE_GRID_A_POWER, rn.ACTIVE_GRID_B_POWER, rn.ACTIVE_GRID_C_POWER
 ]
 
-# Slow update registers (every 60 seconds = 12 heartbeats)# Slow update registers - fetched every 60 seconds (12 heartbeats)
-# These are slowly changing values that don't need frequent updates# Slow update registers (every 60 seconds = 12 heartbeats)
+# Slow update registers - fetched every 5 minutes (10 heartbeats)
+# These are slowly changing values that don't need frequent updates
 SLOW_UPDATE_REGISTERS = [
     rn.EFFICIENCY, rn.DEVICE_STATUS, rn.ACCUMULATED_YIELD_ENERGY, rn.INTERNAL_TEMPERATURE,
     rn.ANTI_REVERSE_MODULE_1_TEMP, rn.INV_MODULE_A_TEMP, rn.INV_MODULE_B_TEMP, rn.INV_MODULE_C_TEMP
@@ -244,7 +271,7 @@ class HuaweiSolarPlugin:
     """
     Domoticz plugin for Huawei Solar inverters via Modbus TCP/IP.
     
-    This plugin fetches inverter data via the huawei-solar library and updates
+    This plugin fetches inverter data via the huawei-solar v3 library and updates
     Domoticz devices with current values. It uses a persistent event loop to
     handle async operations within Domoticz's single-interpreter architecture.
     
@@ -258,9 +285,9 @@ class HuaweiSolarPlugin:
        - Closed properly in onStop() to prevent resource leaks
        
     2. Heartbeat-Based Timing
-       - Domoticz calls onHeartbeat() every 5 seconds
-       - Fast updates: every heartbeat (5s)
-       - Slow updates: every 12 heartbeats (60s)
+       - Domoticz calls onHeartbeat() every 30 seconds
+       - Fast updates: every heartbeat (30s)
+       - Slow updates: every 10 heartbeats (5 min)
        - This avoids need for background threads
        
     3. Value Caching
@@ -276,9 +303,14 @@ class HuaweiSolarPlugin:
     Attributes:
         inverter_address (str): IP address of Huawei inverter
         inverter_port (int): Modbus TCP port (default 502)
-        bridge (Optional[HuaweiSolarBridge]): Connection to inverter
+        slave_id (int): Modbus slave address of the inverter (0-3, default 1).
+                        Use 0 for single-inverter setups or 1-3 for
+                        multi-inverter daisy-chain configurations.
+        bridge (Optional[HuaweiSolarDevice]): Device connection to inverter (v3 API).
+                        Named 'bridge' for backward compatibility, but is a
+                        HuaweiSolarDevice instance in v3.
         async_loop (AbstractEventLoop): PERSISTENT event loop for async operations
-        minute_counter (int): Heartbeat counter for 60-second intervals
+        heartbeat_counter (int): Heartbeat counter for slow update intervals
         accumulated_yield_energy (float): Total energy produced (Wh)
         cached_values (Dict): Caches last value of each register
         last_update_time (float): Timestamp of last update (for monitoring)
@@ -298,8 +330,9 @@ class HuaweiSolarPlugin:
         self.enabled: bool = False
         self.inverter_address: str = "127.0.0.1"
         self.inverter_port: int = 502
-        self.bridge: Optional[HuaweiSolarBridge] = None
-        self.minute_counter: int = 0
+        self.slave_id: int = 1
+        self.bridge: Optional[HuaweiSolarDevice] = None
+        self.heartbeat_counter: int = 0
         self.accumulated_yield_energy: float = 0
         
         # CRITICAL: Create event loop ONCE - reuse in every onHeartbeat()
@@ -309,9 +342,13 @@ class HuaweiSolarPlugin:
         self.efficiency: float = 0
         self.device_status: str = ""
         
-        # New: Value caching to avoid unnecessary Domoticz updates
+        # Value caching to avoid unnecessary Domoticz updates
         self.cached_values: Dict[str, Any] = {}
         self.last_update_time: float = time.time()
+        
+        # Failure tracking for exponential backoff
+        self.consecutive_failures: int = 0
+        self.skip_heartbeats: int = 0
 
     def onStart(self) -> None:
         """
@@ -323,7 +360,7 @@ class HuaweiSolarPlugin:
         - Domoticz restarts
         
         Responsibilities:
-        - Read configuration parameters (IP address, port)
+        - Read configuration parameters (IP address, port, Modbus slave ID)
         - Create Domoticz devices from DEVICE_CONFIGS
         - Establish connection to inverter
         - Set heartbeat interval
@@ -331,11 +368,14 @@ class HuaweiSolarPlugin:
         Note: Does NOT create event loop - that's done in __init__
         """
         Domoticz.Log("onStart called")
-        self.minute_counter = 0
+        self.heartbeat_counter = 0
         
         # Read parameters from Domoticz plugin configuration
         self.inverter_address = Parameters["Address"].strip()
         self.inverter_port = int(Parameters["Port"].strip())
+        self.slave_id = int(Parameters["Mode1"].strip()) if Parameters.get("Mode1", "").strip() else 1
+        
+        Domoticz.Log(f"Configuration: address={self.inverter_address}, port={self.inverter_port}, slave_id={self.slave_id}")
         
         # Establish connection to inverter
         self.bridge = self._connect_inverter()
@@ -350,7 +390,7 @@ class HuaweiSolarPlugin:
             self._create_device("Energy Meter", 243, 29, 4)
 
         # Set heartbeat interval: Domoticz will call onHeartbeat() every N seconds
-        Domoticz.Heartbeat(5)
+        Domoticz.Heartbeat(30)
 
     def onStop(self) -> None:
         """
@@ -368,12 +408,15 @@ class HuaweiSolarPlugin:
         """
         Domoticz.Log("onStop called")
         
+        # Clean up bridge connection first
+        self._cleanup_bridge()
+        
         # Close event loop - IMPORTANT for plugin reload scenarios
         if self.async_loop and not self.async_loop.is_closed():
             try:
                 self.async_loop.close()
             except Exception as e:
-                Domoticz.Warning(f"Error closing event loop: {e}")
+                Domoticz.Log(f"Error closing event loop: {e}")
 
     def onConnect(self, Connection, Status: int, Description: str) -> None:
         """
@@ -435,73 +478,114 @@ class HuaweiSolarPlugin:
 
     def onHeartbeat(self) -> None:
         """
-        Domoticz callback: Main processing loop - called every 5 seconds.
+        Domoticz callback: Main processing loop - called every 30 seconds.
         
         This is the CORE of the plugin. Called at regular intervals to:
-        1. Fetch fast-changing registers (every heartbeat = 5s)
-        2. Fetch slow-changing registers (every 12 heartbeats = 60s)
+        1. Fetch fast-changing registers (every heartbeat = 30s)
+        2. Fetch slow-changing registers (every 10 heartbeats = 5 min)
         3. Update Domoticz devices with new values
-        4. Handle errors and reconnection
+        4. Handle errors with backoff to prevent blocking Domoticz
         
         CRITICAL DESIGN NOTES:
-        - Uses the PERSISTENT event loop created in __init__
-        - Does NOT create new event loops
-        - Does NOT use asyncio.run() which conflicts with Domoticz interpreter
-        - Uses heartbeat counter for timing without background threads
-        
-        Flow:
-        1. Check if bridge connection exists
-        2. Fetch fast registers via run_until_complete()
-        3. Process results and update devices
-        4. Every 12 heartbeats: fetch slow registers
-        5. Catch and handle any exceptions with graceful recovery
+        - Uses asyncio.wait_for() to enforce timeouts on all async operations
+        - Implements exponential backoff on consecutive failures
+        - Does NOT reconnect in the error path (deferred to next heartbeat)
         """
         Domoticz.Debug("onHeartbeat called")
 
+        # Backoff: skip heartbeats after repeated failures
+        if self.skip_heartbeats > 0:
+            self.skip_heartbeats -= 1
+            Domoticz.Debug(f"Backing off, skipping heartbeat ({self.skip_heartbeats} remaining)")
+            self.heartbeat_counter += 1
+            return
+
         try:
             if not self.bridge:
-                Domoticz.Warning("Bridge not available, attempting reconnection...")
+                Domoticz.Log("Bridge not available, attempting reconnection...")
                 self.bridge = self._connect_inverter()
                 if not self.bridge:
+                    self._handle_failure()
                     return
 
             # ================================================================
-            # FAST UPDATE: Every heartbeat (5 seconds)
+            # FAST UPDATE: Every heartbeat (30 seconds)
             # ================================================================
-            # These are rapidly changing values (power, voltage, current)
             try:
-                # CRITICAL: Use run_until_complete() with the PERSISTENT loop
-                # NOT asyncio.run() which creates new loops
+                # CRITICAL: wrap in wait_for() to prevent indefinite hangs
                 result = self.async_loop.run_until_complete(
-                    self.bridge.batch_update(FAST_UPDATE_REGISTERS)
+                    wait_for(
+                        self.bridge.batch_update(FAST_UPDATE_REGISTERS),
+                        timeout=BATCH_UPDATE_TIMEOUT
+                    )
                 )
                 self._process_results(result, register_type="fast")
+                # Success: reset failure counter
+                self.consecutive_failures = 0
+            except AsyncTimeoutError:
+                Domoticz.Error(f"Fast update timed out after {BATCH_UPDATE_TIMEOUT}s")
+                self._handle_failure()
+                return
             except Exception as e:
                 Domoticz.Error(f"Error in fast update: {str(e)}")
-                self._reconnect_inverter()
+                self._handle_failure()
                 return
 
             # ================================================================
-            # SLOW UPDATE: Every 12 heartbeats (60 seconds)
+            # SLOW UPDATE: Every 10 heartbeats (5 minutes)
             # ================================================================
-            # These are slowly changing values (efficiency, status, yield)
-            if self.minute_counter == 12:
-                self.minute_counter = 0
-            
-            if self.minute_counter == 0:
+            if self.heartbeat_counter % 10 == 0:
                 try:
                     result = self.async_loop.run_until_complete(
-                        self.bridge.batch_update(SLOW_UPDATE_REGISTERS)
+                        wait_for(
+                            self.bridge.batch_update(SLOW_UPDATE_REGISTERS),
+                            timeout=BATCH_UPDATE_TIMEOUT
+                        )
                     )
                     self._process_results(result, register_type="slow")
+                except AsyncTimeoutError:
+                    Domoticz.Log(f"Slow update timed out after {BATCH_UPDATE_TIMEOUT}s")
                 except Exception as e:
-                    Domoticz.Warning(f"Error in slow update: {str(e)}")
+                    Domoticz.Log(f"Error in slow update: {str(e)}")
 
-            self.minute_counter += 1
+            self.heartbeat_counter += 1
             
         except Exception as e:
             Domoticz.Error(f"Unexpected error in onHeartbeat: {str(e)}")
-            self._reconnect_inverter()
+            self._handle_failure()
+
+    def _handle_failure(self) -> None:
+        """
+        Handle a connection/update failure with exponential backoff.
+        
+        After MAX_CONSECUTIVE_FAILURES, starts skipping heartbeats to avoid
+        hammering an unresponsive inverter (e.g. at night when it's off).
+        Invalidates the bridge so next attempt will reconnect fresh.
+        """
+        self.consecutive_failures += 1
+        
+        if self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+            self.skip_heartbeats = BACKOFF_HEARTBEATS
+            Domoticz.Log(
+                f"{self.consecutive_failures} consecutive failures. "
+                f"Backing off for {self.skip_heartbeats * 30}s before retry."
+            )
+            # Invalidate bridge - will reconnect on next active heartbeat
+            self._cleanup_bridge()
+        else:
+            # First few failures: just invalidate bridge for reconnect next beat
+            self._cleanup_bridge()
+
+    def _cleanup_bridge(self) -> None:
+        """Safely clean up the bridge connection without blocking."""
+        if self.bridge:
+            try:
+                self.async_loop.run_until_complete(
+                    wait_for(self.bridge.stop(), timeout=5)
+                )
+            except Exception:
+                pass  # Don't let cleanup errors propagate
+        self.bridge = None
 
     def _process_results(self, result: Dict[str, Any], register_type: str = "fast") -> None:
         """
@@ -514,8 +598,9 @@ class HuaweiSolarPlugin:
         This reduces database writes and improves efficiency.
         
         Args:
-            result (Dict[str, Any]): Dictionary of register_name -> [value, unit]
-                                    returned by huawei_solar.batch_update()
+            result (Dict[str, Any]): Dictionary of register_name -> Result(value, unit)
+                                    returned by huawei_solar v3 batch_update().
+                                    Result is a dataclass with .value and .unit attributes.
             register_type (str): Either "fast" or "slow" for cache key generation
         
         Algorithm:
@@ -525,12 +610,12 @@ class HuaweiSolarPlugin:
         4. For others: check cache - only update if value changed
         5. Update energy meter with combined power and yield
         
-        Example result dict:
+        Example result dict (v3 format):
         {
-            'pv_01_voltage': [100.5, 'V'],
-            'phase_A_current': [5.3, 'A'],
-            'active_power_fast': [2500, 'W'],
-            'accumulated_yield_energy': [123456, 'kWh'],
+            'pv_01_voltage': Result(value=100.5, unit='V'),
+            'phase_A_current': Result(value=5.3, unit='A'),
+            'active_power_fast': Result(value=2500, unit='W'),
+            'accumulated_yield_energy': Result(value=123456, unit='kWh'),
         }
         """
         updated_count = 0
@@ -546,15 +631,15 @@ class HuaweiSolarPlugin:
             if key == 'accumulated_yield_energy':
                 try:
                     # Convert kWh to Wh for consistency
-                    self.accumulated_yield_energy = value[0] * 1000
+                    self.accumulated_yield_energy = value.value * 1000
                     Domoticz.Debug(f"Updated accumulated yield: {self.accumulated_yield_energy}")
                 except Exception as e:
                     Domoticz.Debug(f"Error processing yield: {e}")
                 continue
             
             try:
-                # Extract value from tuple (value, unit)
-                device_value = str(value[0]) if isinstance(value, (list, tuple)) else str(value)
+                # v3: Extract value from Result dataclass (.value attribute)
+                device_value = str(value.value)
                 
                 # VALUE CACHING: Only update if value actually changed
                 # This is important for:
@@ -568,52 +653,56 @@ class HuaweiSolarPlugin:
                     updated_count += 1
                 
             except (ValueError, IndexError, TypeError) as e:
-                Domoticz.Warning(f"Error processing register {key}: {str(e)}")
+                Domoticz.Log(f"Error processing register {key}: {str(e)}")
 
         # Update energy meter with combined values
         # Energy meter shows: current_power;total_yield
         if 'active_power_fast' in result:
             try:
-                active_power = result['active_power_fast'][0]
+                # v3: Access .value on Result dataclass
+                active_power = result['active_power_fast'].value
                 energy_value = f"{active_power};{self.accumulated_yield_energy}"
                 self._update_device("Energy Meter", energy_value)
                 updated_count += 1
             except Exception as e:
-                Domoticz.Warning(f"Error updating energy meter: {str(e)}")
+                Domoticz.Log(f"Error updating energy meter: {str(e)}")
         
         if updated_count > 0:
             Domoticz.Debug(f"Updated {updated_count} devices ({register_type})")
 
-    def _connect_inverter(self) -> Optional[HuaweiSolarBridge]:
+    def _connect_inverter(self) -> Optional[HuaweiSolarDevice]:
         """
         Establish connection to Huawei inverter via Modbus TCP.
         
-        Uses the huawei-solar library's create_tcp_bridge() function to
-        create a connection object. This connection is then reused for all
-        batch_update() calls in onHeartbeat().
+        Uses the huawei-solar v3 two-step connection pattern:
+        1. create_tcp_client() - synchronous, creates the Modbus TCP client
+        2. create_device_instance() - async, auto-detects device type
         
-        CRITICAL: This uses the PERSISTENT event loop created in __init__
+        CRITICAL: Uses wait_for() to enforce CONNECTION_TIMEOUT
         
         Returns:
-            HuaweiSolarBridge if connection successful, None if failed
-            
-        Side effects:
-            - Logs connection success/failure
-            - Returns None on any exception (connection failure)
+            HuaweiSolarDevice if connection successful, None if failed
         """
-        Domoticz.Log(f"Connecting to inverter at {self.inverter_address}:{self.inverter_port}")
+        Domoticz.Log(f"Connecting to inverter at {self.inverter_address}:{self.inverter_port} (unit_id={self.slave_id})")
         try:
-            # Use the PERSISTENT event loop (created in __init__)
-            # NOT asyncio.run() which creates new loops
+            client = create_tcp_client(
+                host=self.inverter_address,
+                port=self.inverter_port,
+                unit_id=self.slave_id
+            )
+            
+            # Use wait_for() to prevent hanging on unresponsive inverters
             bridge = self.async_loop.run_until_complete(
-                create_tcp_bridge(
-                    host=self.inverter_address,
-                    port=self.inverter_port,
-                    slave_id=1
+                wait_for(
+                    create_device_instance(client),
+                    timeout=CONNECTION_TIMEOUT
                 )
             )
-            Domoticz.Log("Inverter connected successfully")
+            Domoticz.Log(f"Inverter connected successfully (unit_id={self.slave_id}, type={type(bridge).__name__})")
             return bridge
+        except AsyncTimeoutError:
+            Domoticz.Error(f"Connection timed out after {CONNECTION_TIMEOUT}s")
+            return None
         except Exception as e:
             Domoticz.Error(f"Failed to connect to inverter: {str(e)}")
             return None
@@ -622,27 +711,16 @@ class HuaweiSolarPlugin:
         """
         Attempt to reconnect to inverter after connection failure.
         
-        Called when:
-        - Connection is None
-        - batch_update() raises an exception
-        - Multiple consecutive update failures detected
-        
-        Attempts to cleanly close old bridge before creating new one.
+        Uses _cleanup_bridge for safe disconnection with timeout,
+        then attempts a fresh connection.
         """
-        try:
-            if self.bridge:
-                try:
-                    self.async_loop.run_until_complete(self.bridge.stop())
-                except Exception:
-                    pass  # Ignore errors when closing failed connection
-            
-            self.bridge = self._connect_inverter()
-            if self.bridge:
-                Domoticz.Log("Reconnected successfully")
-            else:
-                Domoticz.Error("Reconnection failed")
-        except Exception as e:
-            Domoticz.Error(f"Reconnection attempt failed: {e}")
+        self._cleanup_bridge()
+        self.bridge = self._connect_inverter()
+        if self.bridge:
+            Domoticz.Log("Reconnected successfully")
+            self.consecutive_failures = 0
+        else:
+            Domoticz.Error("Reconnection failed")
 
     def _get_device(self, name: str) -> int:
         """
